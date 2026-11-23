@@ -6,6 +6,8 @@ services:
       - "8000:8000"
     environment:
       EVALUATION_DB: /data/evaluations.sqlite3
+      # Max per-photo ranking records kept in the process LRU cache.
+      DISTANCE_CACHE_LIMIT: "32000"
     volumes:
       - eval-data:/data
     restart: unless-stopped

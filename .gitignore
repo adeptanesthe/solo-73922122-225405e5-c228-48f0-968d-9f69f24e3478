@@ -7,3 +7,12 @@ examples/v1_evaluation.json
 examples/v2_evaluation.json
 examples/correction_response.json
 examples/stale_response.json
+examples/v1_1000_evaluation.json
+examples/v1_1000_stats.json
+examples/v2_1000_evaluation.json
+examples/v3_1000_evaluation.json
+examples/merge_1000_response.json
+examples/merge_1000_stats.json
+examples/split_1000_response.json
+examples/split_1000_stats.json
+examples/create_batch_1000.request.json

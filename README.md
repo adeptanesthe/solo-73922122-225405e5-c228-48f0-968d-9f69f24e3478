@@ -19,6 +19,8 @@ docker compose up --build
 
 The SQLite file lives on the `eval-data` volume at
 `/data/evaluations.sqlite3`. Override with the `EVALUATION_DB` env var.
+The in-process ranking cache keeps at most `DISTANCE_CACHE_LIMIT` records
+(default 32000; set to `0` to disable caching and always rebuild).
 
 Without Docker:
 
@@ -74,6 +76,43 @@ accuracies). With a single group the response is `evaluable: false`,
 Predictions: nearest Euclidean distance over photos outside the group, using
 exact integer squared distances; ties are broken by the smallest photo ID.
 
+### `GET /batches/{batch_id}/compute-stats` → 200
+
+Distance-work counters for one batch, plus the process-wide cache footprint:
+
+- `new_squared_distance_calculations`: cumulative number of squared distances
+  actually evaluated (bulk batch creation is counted **once per unordered
+  photo pair**, so a 1000-photo batch reports `1000*999/2 = 499500`).
+- `bulk_pair_calculations`, `ranking_records_built`,
+  `ranking_records_rebuilt`, `ranking_records_reused`: how the work split
+  between batch warming, on-demand rebuilds, and cache hits.
+- `cache_limit`, `cached_ranking_records`: the process cap (default 32000)
+  and the current number of retained records across all batches.
+- `events`: one entry per batch creation / committed correction, each with
+  its own counters. Failed corrections roll back and append no event.
+
+Counters live in process memory and reset on restart; predictions themselves
+are stored in SQLite and stay exact after a restart.
+
+## Distance ranking cache
+
+Features are fixed once a batch is created, so for every photo the service
+builds one full ranking of all other photos by exact squared distance
+(secondary sort key: photo index, which implements the smallest-ID tie
+break). Corrections never change a ranking — they only change which entries
+are group-eligible:
+
+- **Merge:** the old nearest neighbours that now belong to the merged group
+  are skipped, and the search continues down the same cached ranking.
+- **Split:** photos that regain out-of-group eligibility re-enter the
+  candidate set through the same cached ranking; no distance is recomputed.
+
+The cache is a single-process, thread-safe LRU holding at most
+`DISTANCE_CACHE_LIMIT` records (default **32000**, one record is one photo's
+complete ranking). When a record is missing (evicted or never built in this
+process, e.g. after a restart) it is rebuilt from the batch features stored
+in SQLite, so every answer remains exact; only the work counters increase.
+
 ## Demonstration (before/after a correction)
 
 ```bash
@@ -87,6 +126,30 @@ recomputes exactly `p01,p02,p03,p04`, and the score drops to `2/5 = 0.4`.
 The script also shows a stale version-1 correction rejected with 409.
 `examples/requests.sh` writes the raw responses next to the payloads.
 
+## 1000-photo merge/split demonstration
+
+`examples/create_batch_1000.json` (regenerate with
+`python3 examples/generate_batch_1000.py`) contains 1000 photos: two 50-photo
+chains (`p0000..p0049`, `p0050..p0099`) placed in one tight feature cluster,
+plus 900 far-away singletons. At version 1 every chain photo's nearest
+out-of-group neighbour is in the *other* chain.
+
+```bash
+BASE_URL=http://127.0.0.1:8000 bash examples/requests_1000.sh
+```
+
+The script:
+
+1. creates the batch — bulk work counted as `499500` unordered photo pairs,
+   and all 1000 ranking records are cached;
+2. adds `p0000-p0050`, merging the two 50-photo groups: all 100 chain photos
+   lose their previous nearest neighbour and are re-predicted against photos
+   outside the new 100-photo group, with **zero** new squared-distance
+   calculations (100 records reused);
+3. removes the same link, splitting the group so the cross-chain neighbours
+   become eligible again — again **zero** new calculations;
+4. asserts version 3 reproduces version 1 exactly.
+
 ## Tests
 
 ```bash
@@ -94,7 +157,10 @@ pip install -r requirements-dev.txt
 python3 -m pytest -q
 ```
 
-18 tests cover ingestion/validation, the 1000-photo limit, grouping, exact tie
+32 tests cover ingestion/validation, the 1000-photo limit, grouping, exact tie
 breaking, brute-force cross-checks, incremental recomputation, version
-conflicts, concurrent writers, rollback on failure, and reads during an
-in-flight correction.
+conflicts, concurrent writers, rollback on failure, reads during an
+in-flight correction, ranking-cache reuse on merge/split, LRU eviction and
+on-demand rebuild, empty-cache restart exactness, the global 32000-record
+cap, compute-stats accounting, orphan-record cleanup on failed creation, and
+rollback of work counters on failure.

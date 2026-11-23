@@ -134,3 +134,29 @@ class CorrectionOut(BaseModel):
     message: str | None = None
     overall_accuracy: float | None = None
     version_created_at: str
+
+
+class ComputeEventOut(BaseModel):
+    phase: Literal["batch_created", "correction"]
+    at_version: int
+    action: Literal["add", "remove"] | None = None
+    new_squared_distance_calculations: int
+    bulk_pair_calculations: int
+    ranking_records_built: int
+    ranking_records_rebuilt: int
+    ranking_records_reused: int
+
+
+class ComputeStatsOut(BaseModel):
+    """Distance-work counters; response fields of the original API are untouched."""
+
+    batch_id: str
+    cache_limit: int
+    cached_ranking_records: int
+    batch_cached_ranking_records: int
+    new_squared_distance_calculations: int
+    bulk_pair_calculations: int
+    ranking_records_built: int
+    ranking_records_rebuilt: int
+    ranking_records_reused: int
+    events: list[ComputeEventOut]

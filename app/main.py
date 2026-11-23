@@ -15,11 +15,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from .database import initialize
 from .models import (
     BatchCreateRequest,
+    ComputeStatsOut,
     CorrectionOut,
     CorrectionRequest,
     EvaluationOut,
 )
-from .service import ServiceError, apply_correction, create_batch, load_evaluation
+from .service import (
+    ServiceError,
+    apply_correction,
+    create_batch,
+    load_compute_stats,
+    load_evaluation,
+)
 
 DEFAULT_DB_PATH = "data/evaluations.sqlite3"
 
@@ -92,6 +99,15 @@ def create_app() -> FastAPI:
     )
     def read_evaluation(batch_id: str, path: str = Depends(db_path)) -> dict:
         return load_evaluation(path, batch_id)
+
+    @app.get(
+        "/batches/{batch_id}/compute-stats",
+        response_model=ComputeStatsOut,
+        tags=["evaluation"],
+        summary="Inspect squared-distance work counters and cache usage",
+    )
+    def read_compute_stats(batch_id: str, path: str = Depends(db_path)) -> dict:
+        return load_compute_stats(path, batch_id)
 
     @app.post(
         "/batches/{batch_id}/corrections",

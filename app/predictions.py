@@ -7,6 +7,8 @@ from collections.abc import Sequence
 
 import numpy as np
 
+from .distance_cache import distance_cache, zero_delta
+
 
 def predict_nearest_outside(
     photo_ids: Sequence[str],
@@ -69,6 +71,46 @@ def predict_nearest_outside(
             "correct": predicted_species == species_by_id[target_id],
         }
     return predictions
+
+
+def predict_nearest_outside_cached(
+    batch_id: str,
+    photo_ids: Sequence[str],
+    species_by_id: dict[str, str],
+    features: np.ndarray,
+    group_by_id: dict[str, int],
+    target_photo_ids: Sequence[str],
+    cache=distance_cache,
+) -> tuple[dict[str, dict], dict[str, int]]:
+    """Cached counterpart of :func:`predict_nearest_outside`.
+
+    Returns the same prediction dictionaries plus a statistics delta. Rankings
+    built at batch creation are reused, so a merge/split correction normally
+    performs zero new squared-distance calculations. A cache miss rebuilds the
+    affected ranking from immutable features and still yields exact results.
+    """
+    if list(photo_ids) != sorted(photo_ids):
+        raise ValueError("photo_ids must be sorted ascending for deterministic ties")
+    targets = sorted(set(target_photo_ids))
+    group_count = len(set(group_by_id.values()))
+    if group_count < 2 or not targets:
+        return {}, zero_delta()
+
+    nearest, delta = cache.nearest_outside_batch(
+        batch_id, photo_ids, features, group_by_id, targets
+    )
+    predictions: dict[str, dict] = {}
+    for target_id, (nearest_id, squared) in nearest.items():
+        predicted_species = species_by_id[nearest_id]
+        predictions[target_id] = {
+            "photo_id": target_id,
+            "known_species": species_by_id[target_id],
+            "predicted_species": predicted_species,
+            "nearest_photo_id": nearest_id,
+            "distance": math.sqrt(squared),
+            "correct": predicted_species == species_by_id[target_id],
+        }
+    return predictions, delta
 
 
 def summarize_groups(

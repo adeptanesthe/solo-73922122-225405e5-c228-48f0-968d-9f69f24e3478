@@ -12,9 +12,14 @@ from typing import Any
 import numpy as np
 
 from .database import connect, read_snapshot, write_transaction
+from .distance_cache import DELTA_FIELDS, distance_cache, zero_delta
 from .grouping import build_groups, changed_membership_ids, group_index, normalize_pair
 from .models import BatchCreateRequest, CorrectionRequest
-from .predictions import predict_nearest_outside, summarize_groups
+from .predictions import (
+    predict_nearest_outside as _brute_force_predict,
+    predict_nearest_outside_cached,
+    summarize_groups,
+)
 
 SINGLE_GROUP_MESSAGE = (
     "All photos belong to a single group, so no photo has an out-of-group "
@@ -97,19 +102,69 @@ def _load_predictions(
     }
 
 
+# The work delta of a cached prediction call is kept in the cache object's
+# guarded one-shot slot, so the service entry point keeps its historical
+# single-dict return shape.
+
+
+def predict_nearest_outside(
+    photo_ids: Sequence[str],
+    species: dict[str, str],
+    features: np.ndarray,
+    groups_or_mapping: dict[str, int] | Sequence[Sequence[str]],
+    target_photo_ids: Sequence[str],
+    batch_id: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Service-level prediction entry point.
+
+    With a ``batch_id`` the process-wide distance ranking cache is used so
+    corrections reuse pair distances already calculated for the batch. Without
+    one it falls back to the exact brute-force path used by the test oracle.
+    The work delta of a cached call is retrievable via
+    :func:`consume_prediction_delta`.
+    """
+    if isinstance(groups_or_mapping, dict):
+        mapping = groups_or_mapping
+    else:
+        mapping = group_index(groups_or_mapping)
+    if batch_id is None:
+        return _brute_force_predict(
+            photo_ids, species, features, mapping, target_photo_ids
+        )
+    predictions, _ = predict_nearest_outside_cached(
+        batch_id, photo_ids, species, features, mapping, target_photo_ids
+    )
+    return predictions
+
+
+def consume_prediction_delta(batch_id: str) -> dict[str, int]:
+    """Take and clear the work delta of the latest cached prediction call."""
+    return distance_cache.consume_last_delta(batch_id)
+
+
 def _compute_evaluation(
     photo_ids: Sequence[str],
     species: dict[str, str],
     features: np.ndarray,
     groups: Sequence[Sequence[str]],
-) -> tuple[dict[str, dict[str, Any]], float | None, bool]:
+    batch_id: str | None = None,
+) -> tuple[dict[str, dict[str, Any]], float | None, bool, dict[str, int]]:
+    delta = zero_delta()
     if len(groups) < 2:
-        return {}, None, False
+        return {}, None, False, delta
 
     mapping = group_index(groups)
-    predictions = predict_nearest_outside(photo_ids, species, features, mapping, photo_ids)
+    if batch_id is None:
+        predictions = _brute_force_predict(
+            photo_ids, species, features, mapping, photo_ids
+        )
+    else:
+        predictions = predict_nearest_outside(
+            photo_ids, species, features, mapping, photo_ids, batch_id=batch_id
+        )
+        delta = consume_prediction_delta(batch_id)
     _, overall = summarize_groups(groups, predictions, True)
-    return predictions, overall, True
+    return predictions, overall, True, delta
 
 
 def create_batch(db_path: str, request: BatchCreateRequest) -> dict[str, Any]:
@@ -135,8 +190,13 @@ def create_batch(db_path: str, request: BatchCreateRequest) -> dict[str, Any]:
     )
     edges = {normalize_pair(pair.photo_a, pair.photo_b) for pair in request.pairs}
     groups = build_groups(photo_ids, edges)
-    predictions, overall, evaluable = _compute_evaluation(
-        photo_ids, species, features, groups
+
+    # Features are immutable for the lifetime of the batch, so every photo's
+    # full neighbour ranking is built once here and reused by every later
+    # correction. Counted once per unordered photo pair.
+    warm_delta = distance_cache.warm_batch(batch_id, photo_ids, features)
+    predictions, overall, evaluable, predict_delta = _compute_evaluation(
+        photo_ids, species, features, groups, batch_id=batch_id
     )
     created_at = _now()
     reason = None if evaluable else "single_group"
@@ -186,9 +246,21 @@ def create_batch(db_path: str, request: BatchCreateRequest) -> dict[str, Any]:
             )
             _write_groups(tx, batch_id, groups)
             _replace_predictions(tx, batch_id, predictions)
+    except BaseException:
+        # The batch never committed: discard rankings warmed for it so the
+        # LRU keeps no orphan records and no work is counted for it.
+        distance_cache.drop_batch(batch_id)
+        raise
     finally:
         connection.close()
 
+    total_delta = zero_delta()
+    for field in DELTA_FIELDS:
+        total_delta[field] = warm_delta[field] + predict_delta[field]
+    distance_cache.commit_stats(batch_id, total_delta)
+    distance_cache.record_event(
+        batch_id, phase="batch_created", at_version=1, delta=total_delta
+    )
     return load_evaluation(db_path, batch_id)
 
 
@@ -299,6 +371,21 @@ def load_evaluation(db_path: str, batch_id: str) -> dict[str, Any]:
         connection.close()
 
 
+def load_compute_stats(db_path: str, batch_id: str) -> dict[str, Any]:
+    """Return per-batch distance-work counters and the cache footprint."""
+    connection = connect(db_path)
+    try:
+        with read_snapshot(connection) as snapshot:
+            batch = snapshot.execute(
+                "SELECT 1 FROM batches WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+            if batch is None:
+                raise ServiceError(404, "batch_not_found", f"batch {batch_id!r} not found")
+    finally:
+        connection.close()
+    return distance_cache.stats_snapshot(batch_id)
+
+
 def apply_correction(
     db_path: str, batch_id: str, request: CorrectionRequest
 ) -> dict[str, Any]:
@@ -346,11 +433,22 @@ def apply_correction(
             changed_ids = changed_membership_ids(old_groups, new_groups, photo_ids)
 
             evaluable = len(new_groups) >= 2
+            compute_delta = zero_delta()
             if evaluable:
                 mapping = group_index(new_groups)
+                # Only photos whose same-group membership changed are
+                # re-predicted; cached pair distances make this zero new work
+                # while rankings remain available, and an evicted/missing
+                # ranking is rebuilt exactly on demand.
                 recomputed = predict_nearest_outside(
-                    photo_ids, species, features, mapping, changed_ids
+                    photo_ids,
+                    species,
+                    features,
+                    mapping,
+                    changed_ids,
+                    batch_id=batch_id,
                 )
+                compute_delta = consume_prediction_delta(batch_id)
                 old_predictions = _load_predictions(tx, batch_id)
                 combined = {
                     photo_id: prediction
@@ -423,6 +521,16 @@ def apply_correction(
     finally:
         connection.close()
 
+    # Reaching this point means the BEGIN IMMEDIATE transaction committed;
+    # failed corrections roll back before this and never touch the counters.
+    distance_cache.commit_stats(batch_id, compute_delta)
+    distance_cache.record_event(
+        batch_id,
+        phase="correction",
+        at_version=request.expected_version + 1,
+        delta=compute_delta,
+        action=request.action,
+    )
     return {
         "batch_id": batch_id,
         "previous_version": request.expected_version,
